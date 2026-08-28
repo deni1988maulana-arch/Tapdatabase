@@ -1,0 +1,470 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TapReview - Sistem Kartu Google Review Permanent</title>
+    
+    <!-- Tailwind CSS CDN -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    
+    <!-- FontAwesome Icon CDN -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    
+    <!-- React & ReactDOM -->
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+    <!-- Firebase SDK (Compat Version untuk CDN Single-File HTML) -->
+    <script src="https://www.gstatic.com/firebasejs/10.8.0/firebase-app-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/10.8.0/firebase-auth-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/10.8.0/firebase-firestore-compat.js"></script>
+
+    <style>
+        .animate-fade-in { animation: fadeIn 0.4s ease-out; }
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+    </style>
+</head>
+<body class="bg-slate-950 text-slate-100 font-sans antialiased min-h-screen">
+
+    <div id="root"></div>
+
+    <script type="text/babel">
+        // =================================================================
+        // ⚠️ PENTING: GANTI ISINYA DENGAN KONFIGURASI FIREBASE ANDA
+        // =================================================================
+        const firebaseConfig = {
+            apiKey: "GANTI_DENGAN_API_KEY_FIREBASE_ANDA",
+            authDomain: "GANTI_DENGAN_AUTH_DOMAIN_FIREBASE_ANDA",
+            projectId: "GANTI_DENGAN_PROJECT_ID_FIREBASE_ANDA",
+            storageBucket: "GANTI_DENGAN_STORAGE_BUCKET_FIREBASE_ANDA",
+            messagingSenderId: "GANTI_DENGAN_MESSAGING_SENDER_ID",
+            appId: "GANTI_DENGAN_APP_ID"
+        };
+
+        // Inisialisasi Firebase
+        let db = null;
+        let auth = null;
+        let isFirebaseConfigured = false;
+
+        try {
+            if (firebaseConfig.apiKey && !firebaseConfig.apiKey.includes("GANTI_DENGAN")) {
+                firebase.initializeApp(firebaseConfig);
+                db = firebase.firestore();
+                auth = firebase.auth();
+                isFirebaseConfigured = true;
+            }
+        } catch (err) {
+            console.error("Gagal menginisialisasi Firebase:", err);
+        }
+
+        const { useState, useEffect } = React;
+
+        function App() {
+            const [cards, setCards] = useState([]);
+            const [loading, setLoading] = useState(true);
+            const [activeTab, setActiveTab] = useState('activator');
+            const [selectedCardId, setSelectedCardId] = useState('');
+
+            // Form State
+            const [inputBusinessName, setInputBusinessName] = useState('');
+            const [inputReviewUrl, setInputReviewUrl] = useState('');
+            const [activationSuccess, setActivationSuccess] = useState(false);
+
+            // Simulator State
+            const [simulatingScan, setSimulatingScan] = useState(false);
+            const [redirectCountdown, setRedirectCountdown] = useState(3);
+            const [redirectTriggered, setRedirectTriggered] = useState(false);
+
+            // 1. Inisialisasi Autentikasi Anonim & Load Data dari Firestore
+            useEffect(() => {
+                if (!isFirebaseConfigured) {
+                    // Fallback jika belum diisi Firebase Config
+                    const defaultCard = {
+                        id: 'CARD-8819-REV',
+                        businessName: 'Kopi Kenangan (Demo)',
+                        reviewUrl: 'https://search.google.com/local/writereview?placeid=ChIJN1t_tDe1vxQRIDoN64pmS-g',
+                        isActivated: true,
+                        scansCount: 15
+                    };
+                    setCards([defaultCard]);
+                    setSelectedCardId(defaultCard.id);
+                    setLoading(false);
+                    return;
+                }
+
+                auth.signInAnonymously().catch(err => console.error("Auth error:", err));
+
+                const unsubscribe = db.collection('cards').onSnapshot(snapshot => {
+                    const loadedCards = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                    
+                    if (loadedCards.length === 0) {
+                        // Kartu Pertama jika DB kosong
+                        const initialCard = {
+                            id: 'CARD-4092-NEW',
+                            businessName: '',
+                            reviewUrl: '',
+                            isActivated: false,
+                            scansCount: 0
+                        };
+                        db.collection('cards').doc(initialCard.id).set(initialCard);
+                    } else {
+                        setCards(loadedCards);
+                        if (!selectedCardId) {
+                            setSelectedCardId(loadedCards[0].id);
+                        }
+                    }
+                    setLoading(false);
+                }, err => {
+                    console.error("Firestore Listen Error:", err);
+                    setLoading(false);
+                });
+
+                return () => unsubscribe();
+            }, []);
+
+            // 2. Cek apakah diakses dari scan QR langsung (URL query string ?scan=CARD-ID)
+            useEffect(() => {
+                const urlParams = new URLSearchParams(window.location.search);
+                const scanId = urlParams.get('scan');
+                if (scanId) {
+                    setSelectedCardId(scanId);
+                    setActiveTab('simulator');
+                    setSimulatingScan(true);
+                }
+            }, [cards]);
+
+            const currentCard = cards.find(c => c.id === selectedCardId) || cards[0] || {};
+
+            useEffect(() => {
+                if (currentCard) {
+                    setInputBusinessName(currentCard.businessName || '');
+                    setInputReviewUrl(currentCard.reviewUrl || '');
+                    setActivationSuccess(false);
+
+                    // Auto-start redirect jika dari scan langsung HP
+                    const urlParams = new URLSearchParams(window.location.search);
+                    if (urlParams.get('scan') && currentCard.isActivated && !redirectTriggered) {
+                        triggerRedirectCount();
+                    }
+                }
+            }, [selectedCardId, currentCard.id]);
+
+            // Save Data ke Firestore
+            const saveCardToDB = async (cardData) => {
+                if (isFirebaseConfigured) {
+                    await db.collection('cards').doc(cardData.id).set(cardData, { merge: true });
+                } else {
+                    setCards(prev => prev.map(c => c.id === cardData.id ? cardData : c));
+                }
+            };
+
+            const handleActivate = async (e) => {
+                e.preventDefault();
+                if (!inputReviewUrl.trim()) return;
+
+                let formattedUrl = inputReviewUrl.trim();
+                if (!formattedUrl.startsWith('http://') && !formattedUrl.startsWith('https://')) {
+                    formattedUrl = 'https://' + formattedUrl;
+                }
+
+                const updatedCard = {
+                    ...currentCard,
+                    businessName: inputBusinessName || 'Usaha Anda',
+                    reviewUrl: formattedUrl,
+                    isActivated: true,
+                    updatedAt: new Date().toISOString()
+                };
+
+                await saveCardToDB(updatedCard);
+                setActivationSuccess(true);
+            };
+
+            const triggerRedirectCount = () => {
+                let count = 3;
+                setRedirectCountdown(count);
+                const timer = setInterval(() => {
+                    count -= 1;
+                    setRedirectCountdown(count);
+                    if (count <= 0) {
+                        clearInterval(timer);
+                        setRedirectTriggered(true);
+                        // Redirect Otomatis Pelanggan
+                        if (currentCard.reviewUrl) {
+                            window.location.href = currentCard.reviewUrl;
+                        }
+                    }
+                }, 1000);
+            };
+
+            const startScanSimulation = async () => {
+                setSimulatingScan(true);
+                setRedirectTriggered(false);
+
+                if (currentCard.isActivated) {
+                    const updatedCard = { 
+                        ...currentCard, 
+                        scansCount: (currentCard.scansCount || 0) + 1 
+                    };
+                    await saveCardToDB(updatedCard);
+                    triggerRedirectCount();
+                }
+            };
+
+            const resetSimulation = () => {
+                setSimulatingScan(false);
+                setRedirectTriggered(false);
+                setRedirectCountdown(3);
+                window.history.pushState({}, document.title, window.location.pathname);
+            };
+
+            const handleCreateNewCard = async () => {
+                const newId = `CARD-${Math.floor(1000 + Math.random() * 9000)}-REV`;
+                const newCard = {
+                    id: newId,
+                    businessName: '',
+                    reviewUrl: '',
+                    isActivated: false,
+                    scansCount: 0
+                };
+                await saveCardToDB(newCard);
+                setSelectedCardId(newId);
+                setActiveTab('activator');
+            };
+
+            const getQrCodeUrl = (text) => {
+                return `https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=${encodeURIComponent(text)}`;
+            };
+
+            const qrTargetUrl = `${window.location.origin}${window.location.pathname}?scan=${currentCard.id || ''}`;
+
+            if (loading) {
+                return (
+                    <div className="min-h-screen flex flex-col items-center justify-center space-y-3">
+                        <i className="fa-solid fa-circle-notch fa-spin text-3xl text-blue-500"></i>
+                        <p className="text-slate-400 text-xs">Menghubungkan Database Cloud...</p>
+                    </div>
+                );
+            }
+
+            return (
+                <div className="flex flex-col min-h-screen">
+                    {/* Warning jika Firebase belum dikonfigurasi */}
+                    {!isFirebaseConfigured && (
+                        <div className="bg-amber-500/20 border-b border-amber-500/40 px-4 py-2 text-center text-xs text-amber-300">
+                            <i className="fa-solid fa-triangle-exclamation mr-1.5"></i>
+                            Mode Demo (Penyimpanan Lokal). Masukkan <strong>firebaseConfig</strong> pada file <code>index.html</code> agar tersimpan di Database Cloud secara nyata.
+                        </div>
+                    )}
+
+                    {/* Header */}
+                    <header className="border-b border-slate-800 bg-slate-900/80 backdrop-blur sticky top-0 z-50">
+                        <div className="max-w-6xl mx-auto px-4 py-3 flex flex-wrap items-center justify-between gap-4">
+                            <div className="flex items-center space-x-3">
+                                <div className="bg-gradient-to-tr from-blue-600 to-indigo-600 p-2.5 rounded-xl shadow-lg">
+                                    <i className="fa-solid fa-qrcode text-white text-xl"></i>
+                                </div>
+                                <div>
+                                    <h1 className="font-bold text-lg text-white">TapReview System</h1>
+                                    <p className="text-xs text-slate-400">Aktivasi Kartu & QR Google Review</p>
+                                </div>
+                            </div>
+
+                            <nav className="flex items-center gap-1 bg-slate-800 p-1 rounded-xl text-xs sm:text-sm">
+                                <button onClick={() => setActiveTab('activator')} className={`px-3 py-1.5 rounded-lg font-medium transition ${activeTab === 'activator' ? 'bg-blue-600 text-white' : 'text-slate-400 hover:text-white'}`}>Aktivasi</button>
+                                <button onClick={() => setActiveTab('simulator')} className={`px-3 py-1.5 rounded-lg font-medium transition ${activeTab === 'simulator' ? 'bg-blue-600 text-white' : 'text-slate-400 hover:text-white'}`}>Simulasi Scan</button>
+                                <button onClick={() => setActiveTab('cards')} className={`px-3 py-1.5 rounded-lg font-medium transition ${activeTab === 'cards' ? 'bg-blue-600 text-white' : 'text-slate-400 hover:text-white'}`}>Daftar Kartu ({cards.length})</button>
+                            </nav>
+                        </div>
+                    </header>
+
+                    {/* Card Selector Bar */}
+                    <div className="bg-slate-900/50 border-b border-slate-800 py-2 px-4 text-xs">
+                        <div className="max-w-6xl mx-auto flex items-center justify-between">
+                            <div className="flex items-center gap-2">
+                                <span className="text-slate-400">Kartu Dipilih:</span>
+                                <select 
+                                    value={selectedCardId} 
+                                    onChange={(e) => setSelectedCardId(e.target.value)}
+                                    className="bg-slate-800 border border-slate-700 rounded-lg px-2.5 py-1 text-slate-200 focus:outline-none"
+                                >
+                                    {cards.map(c => (
+                                        <option key={c.id} value={c.id}>{c.id} {c.isActivated ? `(${c.businessName})` : '[Belum Aktif]'}</option>
+                                    ))}
+                                </select>
+                            </div>
+                            <button onClick={handleCreateNewCard} className="text-blue-400 hover:underline font-medium">+ Tambah Kartu Baru</button>
+                        </div>
+                    </div>
+
+                    {/* Main Container */}
+                    <main className="flex-grow max-w-6xl w-full mx-auto px-4 py-8">
+                        
+                        {/* TAB 1: AKTIVASI */}
+                        {activeTab === 'activator' && (
+                            <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
+                                {/* Visual Fisik Kartu */}
+                                <div className="lg:col-span-5 flex flex-col items-center">
+                                    <div className="w-full max-w-sm bg-gradient-to-b from-slate-900 to-slate-950 p-6 rounded-3xl border border-slate-800 shadow-2xl relative">
+                                        <div className="flex justify-between items-center mb-5">
+                                            <span className="font-mono text-xs bg-slate-800 px-3 py-1 rounded-full border border-slate-700 text-slate-300 font-bold">{currentCard.id}</span>
+                                            {currentCard.isActivated ? (
+                                                <span className="bg-emerald-500/10 text-emerald-400 border border-emerald-500/30 text-xs px-2.5 py-1 rounded-full"><i className="fa-solid fa-check mr-1"></i> Aktif</span>
+                                            ) : (
+                                                <span className="bg-amber-500/10 text-amber-400 border border-amber-500/30 text-xs px-2.5 py-1 rounded-full"><i className="fa-solid fa-lock-open mr-1"></i> Belum Aktif</span>
+                                            )}
+                                        </div>
+
+                                        <div className="bg-gradient-to-tr from-slate-900 via-slate-800 to-slate-900 border border-slate-700/80 rounded-2xl p-6 text-center flex flex-col items-center">
+                                            <div className="text-amber-400 text-sm mb-3 space-x-1">
+                                                {[1,2,3,4,5].map(i => <i key={i} className="fa-solid fa-star"></i>)}
+                                            </div>
+                                            <h3 className="font-bold text-white text-lg mb-1">{currentCard.isActivated ? currentCard.businessName : 'Beri Ulasan Google'}</h3>
+                                            <p className="text-xs text-slate-400 mb-4">Scan QR code di bawah menggunakan kamera HP</p>
+
+                                            <div className="bg-white p-3 rounded-2xl shadow-xl border-4 border-slate-700/50 mb-3">
+                                                <img src={getQrCodeUrl(qrTargetUrl)} alt="QR Code" className="w-40 h-40 object-contain"/>
+                                            </div>
+                                            <p className="text-[11px] text-slate-500">QR siap dicetak ke fisik kartu/standee</p>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                {/* Form Input */}
+                                <div className="lg:col-span-7 bg-slate-900 border border-slate-800 rounded-3xl p-6 sm:p-8 shadow-xl">
+                                    <div className="flex items-center gap-3 mb-6">
+                                        <div className="bg-amber-500/10 p-3 rounded-xl text-amber-400"><i className="fa-solid fa-bolt text-xl"></i></div>
+                                        <div>
+                                            <h2 className="text-xl font-bold text-white">Form Aktivasi Pemilik Usaha</h2>
+                                            <p className="text-xs text-slate-400">Masukkan link Google Review tempat usaha Anda di bawah ini.</p>
+                                        </div>
+                                    </div>
+
+                                    {activationSuccess && (
+                                        <div className="mb-6 bg-emerald-500/10 border border-emerald-500/30 rounded-2xl p-4 flex items-start gap-3 animate-fade-in">
+                                            <i className="fa-solid fa-circle-check text-emerald-400 text-xl mt-0.5"></i>
+                                            <div>
+                                                <h4 className="font-semibold text-emerald-400 text-sm">Data Tersimpan Permanen!</h4>
+                                                <p className="text-xs text-emerald-300/80 mt-1">Kartu ID <strong>{currentCard.id}</strong> telah aktif dan terhubung ke link Google Review usaha Anda.</p>
+                                            </div>
+                                        </div>
+                                    )}
+
+                                    <form onSubmit={handleActivate} className="space-y-5">
+                                        <div>
+                                            <label className="block text-xs text-slate-400 mb-1">ID Unik Kartu</label>
+                                            <input type="text" disabled value={currentCard.id || ''} className="w-full bg-slate-950 border border-slate-800 rounded-xl px-4 py-2.5 text-slate-500 font-mono text-sm"/>
+                                        </div>
+                                        <div>
+                                            <label className="block text-xs text-slate-300 mb-1">Nama Tempat Usaha</label>
+                                            <input type="text" value={inputBusinessName} onChange={(e) => setInputBusinessName(e.target.value)} placeholder="Contoh: Resto Bebek Goreng Slamet" className="w-full bg-slate-950 border border-slate-700 rounded-xl px-4 py-2.5 text-white text-sm focus:ring-2 focus:ring-blue-500 outline-none"/>
+                                        </div>
+                                        <div>
+                                            <label className="block text-xs text-slate-300 mb-1">Link Direct Google Review *</label>
+                                            <input type="url" required value={inputReviewUrl} onChange={(e) => setInputReviewUrl(e.target.value)} placeholder="https://g.page/r/XXXXX/review" className="w-full bg-slate-950 border border-slate-700 rounded-xl px-4 py-2.5 text-white text-sm font-mono text-xs focus:ring-2 focus:ring-blue-500 outline-none"/>
+                                        </div>
+
+                                        <button type="submit" className="w-full bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 text-white font-bold py-3.5 rounded-xl shadow-lg transition text-sm">
+                                            <i className="fa-solid fa-floppy-disk mr-2"></i> {currentCard.isActivated ? 'PERBARUI LINK KARTU' : 'AKTIFKAN KARTU SEKARANG'}
+                                        </button>
+                                    </form>
+                                </div>
+                            </div>
+                        )}
+
+                        {/* TAB 2: SIMULASI SCAN */}
+                        {activeTab === 'simulator' && (
+                            <div className="max-w-2xl mx-auto">
+                                <div className="bg-slate-900 border border-slate-800 rounded-3xl p-6 sm:p-8 text-center shadow-2xl">
+                                    <div className="inline-block bg-slate-800 border border-slate-700 px-3 py-1 rounded-full text-xs text-slate-300 mb-6">
+                                        <i className="fa-solid fa-mobile-screen text-blue-400 mr-1.5"></i> Tampilan HP Pelanggan
+                                    </div>
+
+                                    {!simulatingScan ? (
+                                        <div className="py-8 space-y-5">
+                                            <div className="w-20 h-20 mx-auto bg-slate-800 rounded-2xl flex items-center justify-center border border-slate-700">
+                                                <i className="fa-solid fa-qrcode text-4xl text-blue-400"></i>
+                                            </div>
+                                            <h3 className="text-xl font-bold text-white">Simulasi Scan Kartu</h3>
+                                            <p className="text-xs text-slate-400">Pengujian alur saat pelanggan men-scan ID: <strong>{currentCard.id}</strong></p>
+                                            <button onClick={startScanSimulation} className="bg-blue-600 hover:bg-blue-500 text-white font-bold py-3 px-8 rounded-xl text-sm transition shadow-lg">
+                                                Mulai Scan Sekarang
+                                            </button>
+                                        </div>
+                                    ) : (
+                                        <div className="py-6 space-y-6">
+                                            {!currentCard.isActivated ? (
+                                                <div className="bg-amber-500/10 border border-amber-500/30 p-6 rounded-2xl text-left space-y-3">
+                                                    <h4 className="font-bold text-amber-400 text-lg"><i className="fa-solid fa-triangle-exclamation mr-2"></i>Kartu Belum Diaktivasi!</h4>
+                                                    <p className="text-xs text-slate-300">Kartu ini belum memiliki link Google Review. Pemilik usaha harus mengaktivasi terlebih dahulu.</p>
+                                                    <button onClick={() => setActiveTab('activator')} className="w-full bg-amber-500 text-slate-950 font-bold py-2.5 rounded-xl text-xs">Ke Halaman Aktivasi →</button>
+                                                </div>
+                                            ) : (
+                                                <div>
+                                                    {!redirectTriggered ? (
+                                                        <div className="py-8 space-y-4">
+                                                            <div className="w-16 h-16 mx-auto border-4 border-blue-500/20 border-t-blue-500 rounded-full animate-spin flex items-center justify-center text-xl font-bold text-white">{redirectCountdown}</div>
+                                                            <h4 className="font-bold text-white text-lg">Mengalihkan ke Google Review...</h4>
+                                                            <p className="text-xs text-slate-400">{currentCard.businessName}</p>
+                                                        </div>
+                                                    ) : (
+                                                        <div className="bg-slate-950 border border-slate-800 rounded-2xl p-6 text-left space-y-4 animate-fade-in">
+                                                            <div className="flex justify-between items-center border-b border-slate-800 pb-3">
+                                                                <span className="font-bold text-sm text-white">Google Maps Review</span>
+                                                                <span className="text-[10px] bg-emerald-500/20 text-emerald-400 px-2 py-0.5 rounded-full">Redirect Sukses</span>
+                                                            </div>
+                                                            <h3 className="font-bold text-lg text-white">{currentCard.businessName}</h3>
+                                                            <div className="flex justify-center space-x-2 py-3 bg-slate-900 rounded-xl text-amber-400 text-2xl">
+                                                                {[1,2,3,4,5].map(i => <i key={i} className="fa-solid fa-star hover:scale-110 cursor-pointer"></i>)}
+                                                            </div>
+                                                            <div className="flex justify-between text-xs pt-2">
+                                                                <a href={currentCard.reviewUrl} target="_blank" className="text-blue-400 hover:underline">Buka Link Google Asli</a>
+                                                                <button onClick={resetSimulation} className="text-slate-400 hover:text-white">Reset Simulator</button>
+                                                            </div>
+                                                        </div>
+                                                    )}
+                                                </div>
+                                            )}
+                                        </div>
+                                    )}
+                                </div>
+                            </div>
+                        )}
+
+                        {/* TAB 3: DAFTAR KARTU */}
+                        {activeTab === 'cards' && (
+                            <div className="space-y-6">
+                                <div className="flex justify-between items-center">
+                                    <h2 className="text-xl font-bold text-white">Daftar Kartu Terdaftar</h2>
+                                    <button onClick={handleCreateNewCard} className="bg-blue-600 hover:bg-blue-500 text-white font-bold px-4 py-2 rounded-xl text-xs">+ Tambah Kartu</button>
+                                </div>
+                                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                                    {cards.map(card => (
+                                        <div key={card.id} className={`bg-slate-900 border rounded-2xl p-5 ${card.id === selectedCardId ? 'border-blue-500 ring-1 ring-blue-500' : 'border-slate-800'}`}>
+                                            <div className="flex justify-between items-center mb-2">
+                                                <span className="font-mono text-xs bg-slate-800 px-2 py-1 rounded text-slate-300 font-bold">{card.id}</span>
+                                                {card.isActivated ? <span className="text-[10px] bg-emerald-500/10 text-emerald-400 px-2 py-0.5 rounded-full font-medium">Aktif</span> : <span className="text-[10px] bg-amber-500/10 text-amber-400 px-2 py-0.5 rounded-full font-medium">Belum</span>}
+                                            </div>
+                                            <h4 className="font-bold text-white mb-1">{card.isActivated ? card.businessName : 'Kartu Kosong'}</h4>
+                                            <p className="text-xs text-slate-400 truncate mb-4">{card.isActivated ? card.reviewUrl : '-'}</p>
+                                            <div className="flex justify-between items-center text-xs pt-3 border-t border-slate-800">
+                                                <span className="text-slate-500">Total Scan: <strong className="text-slate-200">{card.scansCount || 0}</strong></span>
+                                                <button onClick={() => { setSelectedCardId(card.id); setActiveTab('activator'); }} className="text-blue-400 font-semibold hover:underline">Edit Kartu →</button>
+                                            </div>
+                                        </div>
+                                    ))}
+                                </div>
+                            </div>
+                        )}
+
+                    </main>
+                </div>
+            );
+        }
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
